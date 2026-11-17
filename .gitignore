@@ -1,0 +1,4 @@
+out/
+*.json.bak
+transcripts.tar.gz
+makefun-keypair.json
