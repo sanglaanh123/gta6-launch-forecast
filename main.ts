@@ -48,11 +48,22 @@ export interface Params {
   w2: number;
   /** pull of the median toward the unweighted pooled median (0 = none) */
   shrink: number;
+  /** share of the local-linear correction applied to each analogue's curve (0 = plain kernel mixture) */
+  ll: number;
+  /** ridge penalty of the local-linear slopes, in standardized feature units */
+  lam: number;
+  /** weight of an analogue whose unlock was one fixed moment (GTA VI unlocks midnight local, rolling) */
+  wf: number;
+  /** weight of an analogue whose unlock is not known */
+  wu: number;
 }
 
 // Chosen by leave-one-out over the comparables already big at hour 1 (node eval.ts <case.in> --grid): LOO loss 0.129.
 // A slightly lower 0.128 sat at the grid's edge with no widening over the day; this keeps some, for one final case.
-export const PARAMS: Params = { bw: 0.8, s0: 0.2, s1: 0.1, w2: 4, shrink: 0 };
+// Round 2 (node eval.ts <case.in> --grid --rolling, scoring only big rolling-midnight launches like GTA VI): LOO 0.118
+// vs 0.126 for round 1's parameters, from favouring rolling-midnight analogues and the local-linear correction. The
+// grid's best (0.117) dropped fixed/unknown unlocks almost entirely; these milder weights keep them as a hedge.
+export const PARAMS: Params = { bw: 0.8, s0: 0.16, s1: 0.1, w2: 10, shrink: 0, ll: 1, lam: 1, wf: 0.3, wu: 0.6 };
 
 const HOUR = 3_600_000;
 const LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95];
@@ -81,6 +92,15 @@ const features = (m: Map<number, number>, t0: number, p1: number): Features => {
   };
 };
 
+/** How a launch unlocked: midnight local country by country (as GTA VI does), one fixed moment, or not known. */
+export type UnlockKind = 'rolling' | 'fixed' | 'unknown';
+export const unlockKind = (unlock: string | undefined): UnlockKind => {
+  const u = unlock ?? '';
+  if (/midnight local|midnight local time|rolling|12 AM local/i.test(u)) return 'rolling';
+  if (/simultaneous|single global|global unlock/i.test(u)) return 'fixed';
+  return 'unknown';
+};
+
 /** Prior weight from the comparable's research tier. */
 const tierWeight = (unlock: string | undefined): number => {
   const u = unlock ?? '';
@@ -90,8 +110,12 @@ const tierWeight = (unlock: string | undefined): number => {
   return 1;
 };
 
+/** An analogue's prior weight: its tier times how alike its unlock is to a rolling-midnight launch. */
+const priorWeight = (a: Analogue, P: Params): number => a.w0 * (a.kind === 'rolling' ? 1 : a.kind === 'fixed' ? P.wf : P.wu);
+
 export interface Analogue {
   w0: number;
+  kind: UnlockKind;
   feat: Features;
   /** log ratio to hour 1 for hours 2..24 (index h), NaN where missing */
   r: number[];
@@ -129,7 +153,7 @@ export const analogues = (comps: Comparable[], skipDayStart?: string): Analogue[
       const ia = a >= 2 ? a : 1;
       r[h] = b <= 24 ? ra + ((r[b] - ra) * (h - ia)) / (b - ia) : ra;
     }
-    out.push({ w0, feat: features(m, t0, p1), r });
+    out.push({ w0, kind: unlockKind(c.unlock), feat: features(m, t0, p1), r });
   }
   return out;
 };
@@ -180,21 +204,44 @@ export const logQuantiles = (an: Analogue[], f: Features, P: Params): number[][]
   let ws = an.map((a) => {
     const d1 = (a.feat.f1 - f.f1) / s1;
     const d2 = (a.feat.f2 - f.f2) / s2;
-    return a.w0 * Math.exp(-(d1 * d1 + P.w2 * d2 * d2) / (2 * P.bw * P.bw));
+    return priorWeight(a, P) * Math.exp(-(d1 * d1 + P.w2 * d2 * d2) / (2 * P.bw * P.bw));
   });
   let tot = ws.reduce((s, x) => s + x, 0);
   if (!(tot > 1e-12)) {
-    ws = an.map((a) => a.w0);
+    ws = an.map((a) => priorWeight(a, P));
     tot = ws.reduce((s, x) => s + x, 0);
   }
   ws = ws.map((w) => w / tot);
-  const flat = an.map((a) => a.w0);
+  const flat = an.map((a) => priorWeight(a, P));
   const flatTot = flat.reduce((s, x) => s + x, 0);
   const flatW = flat.map((w) => w / flatTot);
 
+  // Standardized feature offsets of each analogue from the case, for the local-linear correction.
+  const u1 = an.map((a) => (a.feat.f1 - f.f1) / s1);
+  const u2 = an.map((a) => (a.feat.f2 - f.f2) / s2);
+
   const rows: number[][] = [];
   for (let h = 2; h <= 24; h++) {
-    const xs = an.map((a) => a.r[h]);
+    let xs = an.map((a) => a.r[h]);
+    if (P.ll > 0) {
+      // Weighted ridge regression r = a + b1 u1 + b2 u2 around the case; move each analogue's ratio to the case's
+      // features (subtract b.u), so analogues that differ from the case still say something about it.
+      let sw = 0, m1 = 0, m2 = 0, my = 0;
+      for (let i = 0; i < an.length; i++) {
+        sw += ws[i]; m1 += ws[i] * u1[i]; m2 += ws[i] * u2[i]; my += ws[i] * xs[i];
+      }
+      m1 /= sw; m2 /= sw; my /= sw;
+      let a11 = P.lam, a22 = P.lam, a12 = 0, c1 = 0, c2 = 0;
+      for (let i = 0; i < an.length; i++) {
+        const d1 = u1[i] - m1, d2 = u2[i] - m2, dy = xs[i] - my;
+        a11 += ws[i] * d1 * d1; a22 += ws[i] * d2 * d2; a12 += ws[i] * d1 * d2;
+        c1 += ws[i] * d1 * dy; c2 += ws[i] * d2 * dy;
+      }
+      const det = a11 * a22 - a12 * a12;
+      const b1 = (a22 * c1 - a12 * c2) / det;
+      const b2 = (a11 * c2 - a12 * c1) / det;
+      xs = xs.map((x, i) => x - P.ll * (b1 * u1[i] + b2 * u2[i]));
+    }
     const shift = P.shrink * (wMedian(xs, flatW) - wMedian(xs, ws));
     const s = P.s0 + (P.s1 * (h - 2)) / 22;
     rows.push(LEVELS.map((tau) => mixQuantile(xs, ws, s, tau) + shift));
